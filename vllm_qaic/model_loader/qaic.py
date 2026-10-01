@@ -202,7 +202,6 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             _d: dict = {
                 "input_ids": np.full((self.decode_bsz, _mdt), -1, dtype=np.int64),
                 "position_ids": np.full((self.decode_bsz, _mdt), -1, dtype=np.int64),
-                "batch_index": np.full((self.decode_bsz, 1), -1, dtype=np.int64),
             }
             if self.lora_mode:
                 _d["lora_ids"] = np.full((self.decode_bsz, 1), -1, dtype=np.int64)
@@ -235,7 +234,6 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         prefill_cum_sum: np.ndarray | None = None,
         logits: np.ndarray | None = None,
         block_table: np.ndarray | None = None,
-        slot_id: np.ndarray | None = None,
         num_prompt_tokens_prefill: np.ndarray | None = None,
         tlm_prefill_hidden_chunks: list[np.ndarray] | None = None,
         dflash_decode_hidden_buf: np.ndarray | None = None,
@@ -261,7 +259,6 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                     mm_kwargs_list,
                     logits,
                     block_table,
-                    slot_id,
                     num_prompt_tokens_prefill,
                 )
                 return pending_prefill_exec_queue
@@ -282,7 +279,6 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                         mm_kwargs_list,
                         tlm_prefill_hidden_chunks,
                         block_table,
-                        slot_id,
                     )
                     return pending_prefill_exec_queue
                 else:
@@ -293,7 +289,6 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                         logits,
                         lora_ids,
                         block_table,
-                        slot_id,
                         callback=callback,
                         dflash_decode_hidden_buf=dflash_decode_hidden_buf,
                     )
@@ -447,9 +442,6 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                 QAIC_BLOCK_TABLE_PADDING_VALUE,
                 dtype=np.int64,
             )
-            self.decode_batch_inputs["slot_id"] = np.full(
-                (self.decode_bsz,), 0, dtype=np.int64
-            )
 
         e = time.perf_counter() - s
         logger.info("Successfully loaded QPC in %s secs", e)
@@ -505,9 +497,6 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                         "position_ids": np.full(
                             (self.decode_bsz, _mdt), -1, dtype=np.int64
                         ),
-                        "batch_index": np.full(
-                            (self.decode_bsz, 1), -1, dtype=np.int64
-                        ),
                     }
                     if self.lora_mode:
                         _d["lora_ids"] = np.full(
@@ -556,11 +545,6 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                     prefill_start + self.session.prefill_num_execObj,
                 )
             }
-        if "batch_index" in self.session.input_names:
-            self.ignore_batch_index = False
-        else:
-            self.ignore_batch_index = True
-            self.decode_batch_inputs.pop("batch_index", None)
         if self.disagg_producer_en:
             self.decode_bsz = 0
 
@@ -631,19 +615,16 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         chunk_inputs: dict,
         batch_idx: int,
         block_table: np.ndarray | None,
-        slot_id: np.ndarray | None,
         req_index: int,
     ) -> None:
         if not self.paged_attention:
             return
-        if block_table is not None and slot_id is not None:
+        if block_table is not None:
             chunk_inputs["block_table"] = block_table[
                 req_index : req_index + 1
             ].reshape(1, 1, self.num_gpu_blocks_per_batch)
-            chunk_inputs["slot_id"] = slot_id[req_index : req_index + 1]
         else:
             chunk_inputs["block_table"] = batch_idx
-            chunk_inputs["slot_id"] = 0
 
     def _run_pipeline_prefill(
         self,
@@ -659,7 +640,6 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         mm_kwargs_list: list[dict] | None = None,
         logits: np.ndarray | None = None,
         block_table: np.ndarray | None = None,
-        slot_id: np.ndarray | None = None,
         num_prompt_tokens_prefill: np.ndarray | None = None,
     ):
         # set qpc prefill state
@@ -707,8 +687,7 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
 
             # create chunk inputs
             chunk_inputs = dict()
-            batch_index = batch_indices[index]
-            chunk_inputs["batch_index"] = batch_indices[index : index + 1].reshape(1, 1)
+            batch_index = int(batch_indices[index])
             if lora_ids is not None:
                 chunk_inputs["lora_ids"] = lora_ids
             if mm_kwargs_list and (mm_kwargs := mm_kwargs_list[index]):
@@ -759,7 +738,7 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                         chunk_inputs["logits"] = logits[index : index + 1]
 
                 self._inject_pa_prefill_inputs(
-                    chunk_inputs, batch_index, block_table, slot_id, index
+                    chunk_inputs, batch_index, block_table, index
                 )
 
                 if self.session.prefill_available_exec_objs.empty():
@@ -773,7 +752,10 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                     self.complete_inf(eid, True, pipeline_prefill_en=True)
                 # Submit Chunk to LRT Queue
                 exec_obj_idx = self.session.np_run_pipeline(
-                    inputs=chunk_inputs,
+                    inputs={
+                        **chunk_inputs,
+                        "batch_index": np.array([[batch_index]], dtype=np.int64),
+                    },
                     last_chunk=last_chunk,
                     kv_cache_buffers=kv_caches[batch_index] if last_chunk else None,
                 )
@@ -818,7 +800,6 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         mm_kwargs_list: list[dict] | None = None,
         tlm_prefill_hidden_chunks: list[np.ndarray] | None = None,
         block_table: np.ndarray | None = None,
-        slot_id: np.ndarray | None = None,
     ) -> np.ndarray:
         # perform prefill (only prefill_bsz=1 is supported)
         idx_start = 0
@@ -854,16 +835,13 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
 
             # create chunk inputs
             chunk_inputs = dict()
-            if not self.ignore_batch_index:
-                batch_index = batch_indices[i : i + 1].reshape(1, 1)
-                chunk_inputs["batch_index"] = batch_index
             if lora_ids is not None:
                 lora_index = lora_ids[i : i + 1].reshape(1, 1)
                 chunk_inputs["lora_ids"] = lora_index
             if mm_kwargs_list and (mm_kwargs := mm_kwargs_list[i]):
                 chunk_inputs.update(mm_kwargs)
             self._inject_pa_prefill_inputs(
-                chunk_inputs, batch_indices[i], block_table, slot_id, i
+                chunk_inputs, int(batch_indices[i]), block_table, i
             )
             # chunk the request
             n_chunks: int = iids.shape[-1] // self.prefill_seq_len
@@ -950,7 +928,6 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         logits: np.ndarray,
         lora_ids: np.ndarray | None = None,
         block_table: np.ndarray | None = None,
-        slot_id: np.ndarray | None = None,
         callback: Callable | None = None,
         dflash_decode_hidden_buf: np.ndarray | None = None,
     ) -> None:
@@ -979,32 +956,24 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             batch_inputs["input_ids"][num_decodes:] = -1
             batch_inputs["position_ids"][..., num_decodes:, :] = -1
 
-        if not self.ignore_batch_index:
-            batch_inputs["batch_index"][:num_decodes, 0] = batch_indices
-            if num_decodes < self.decode_bsz:
-                batch_inputs["batch_index"][num_decodes:] = -1
-
         if lora_ids is not None:
             batch_inputs["lora_ids"][:num_decodes] = lora_ids.reshape(num_decodes, 1)
             if num_decodes < self.decode_bsz:
                 batch_inputs["lora_ids"][num_decodes:] = -1
 
         if self.paged_attention:
-            if block_table is not None and slot_id is not None:
+            if block_table is not None:
                 batch_inputs["block_table"][:, :num_decodes] = block_table[:num_decodes]
-                batch_inputs["slot_id"][:num_decodes] = slot_id[:num_decodes]
                 if num_decodes < self.decode_bsz:
                     batch_inputs["block_table"][:, num_decodes:] = (
                         QAIC_BLOCK_TABLE_PADDING_VALUE
                     )
-                    batch_inputs["slot_id"][num_decodes:] = 0
             else:
                 batch_inputs["block_table"][:, :num_decodes] = batch_indices
                 if num_decodes < self.decode_bsz:
                     batch_inputs["block_table"][:, num_decodes:] = (
                         QAIC_BLOCK_TABLE_PADDING_VALUE
                     )
-                    batch_inputs["slot_id"][num_decodes:] = 0
 
         # For spec-decode target: include num_logits_to_keep in batch_inputs
         # so the hardware knows how many token positions to compute logits for.
@@ -1234,7 +1203,6 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                     (self.prefill_bsz, self.prefill_seq_len), dtype=np.int64
                 ),
                 "position_ids": _pids,
-                "batch_index": np.arange(self.prefill_bsz).reshape(-1, 1),
             }
             # TODO: mllama3.2 is currently not supported in v0.15.0
             # if input_info := self.get_io_shape_and_dtype("cross_attention_mask"):
@@ -1295,15 +1263,6 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                         (self.decode_bsz, self.num_logits_to_keep), -1, dtype=np.int64
                     ),
                 )
-            if "batch_index" in self.session.input_names:
-                decode_single_inputs["batch_index"] = np.array([[0]])
-                decode_batch_inputs["batch_index"] = np.arange(
-                    self.decode_bsz, dtype=np.int64
-                ).reshape(-1, 1)
-                self.ignore_batch_index = False
-            else:
-                self.ignore_batch_index = True
-
             if self.lora_mode:
                 decode_single_inputs["lora_ids"] = np.array([[0]])
                 decode_batch_inputs["lora_ids"] = np.arange(
@@ -1334,7 +1293,7 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                 self.decode_batch_inputs.update(self.default_mm_kwargs)
             # Keep decode_batch_inputs_by_k in sync: _run_decode reads from this
             # map, so it must point at the rebuilt dict that carries the correct
-            # (MRoPE-aware) position_ids / batch_index / mm-kwargs shapes.
+            # (MRoPE-aware) position_ids / mm-kwargs shapes.
             for _k in self.decode_batch_inputs_by_k:
                 self.decode_batch_inputs_by_k[_k] = self.decode_batch_inputs
         # TODO: Clean up
@@ -1375,7 +1334,6 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                             (self.prefill_bsz, self.prefill_seq_len), dtype=np.int64
                         ),
                         "position_ids": _dummy_pids,
-                        "batch_index": np.arange(self.prefill_bsz).reshape(-1, 1),
                         "logits": np.empty(
                             (self.prefill_bsz, 1, self.vocab_size)
                             if self.logits_ndim == 3
@@ -1398,7 +1356,10 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                             self.comp_ctx_lengths_prefill[-1], dtype=np.int64
                         )
                     exec_obj_idx = self.session.np_run_pipeline(
-                        inputs=prefill_inputs,
+                        inputs={
+                            **prefill_inputs,
+                            "batch_index": np.array([[bidx]], dtype=np.int64),
+                        },
                         slicing_parameters=None,
                         last_chunk=True,
                         kv_cache_buffers=KvCache_buff,
