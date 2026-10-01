@@ -49,6 +49,8 @@ from vllm_qaic.utils.qaic_utils import _clean_config, compute_max_decode_tokens
 
 logger = init_logger(__name__)
 
+QAIC_BLOCK_TABLE_PADDING_VALUE = np.int64(np.iinfo(np.int32).max)
+
 lock = threading.Lock()
 
 
@@ -442,7 +444,7 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         if "block_table" in self.session.input_names:
             self.decode_batch_inputs["block_table"] = np.full(
                 (1, self.decode_bsz, self.num_gpu_blocks_per_batch),
-                -1,
+                QAIC_BLOCK_TABLE_PADDING_VALUE,
                 dtype=np.int64,
             )
             self.decode_batch_inputs["slot_id"] = np.full(
@@ -992,12 +994,16 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                 batch_inputs["block_table"][:, :num_decodes] = block_table[:num_decodes]
                 batch_inputs["slot_id"][:num_decodes] = slot_id[:num_decodes]
                 if num_decodes < self.decode_bsz:
-                    batch_inputs["block_table"][:, num_decodes:] = -1
+                    batch_inputs["block_table"][:, num_decodes:] = (
+                        QAIC_BLOCK_TABLE_PADDING_VALUE
+                    )
                     batch_inputs["slot_id"][num_decodes:] = 0
             else:
                 batch_inputs["block_table"][:, :num_decodes] = batch_indices
                 if num_decodes < self.decode_bsz:
-                    batch_inputs["block_table"][:, num_decodes:] = -1
+                    batch_inputs["block_table"][:, num_decodes:] = (
+                        QAIC_BLOCK_TABLE_PADDING_VALUE
+                    )
                     batch_inputs["slot_id"][num_decodes:] = 0
 
         # For spec-decode target: include num_logits_to_keep in batch_inputs
