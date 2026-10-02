@@ -385,17 +385,10 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
         self.stages: int = stages if stages is not None else 1
         self.disagg_serving_en = kv_transfer_role is not None
         self.disagg_producer_en = kv_transfer_role == "kv_producer"
-        self.num_gpu_blocks_per_batch = cdiv(
-            self.ctx_len, self._cache_config.block_size
+        self.num_gpu_blocks_per_batch = (
+            self._cache_config.num_gpu_blocks_override
+            or cdiv(self.ctx_len, self._cache_config.block_size)
         )
-        if self.paged_attention:
-            self.num_gpu_blocks = (
-                self._cache_config.num_gpu_blocks_override
-                if self._cache_config.num_gpu_blocks_override
-                else cdiv(self.ctx_len, self._cache_config.block_size)
-            )
-        else:
-            self.num_gpu_blocks = self.decode_bsz
 
         logger.info("Loading QPC...")
         logger.info(
@@ -436,7 +429,15 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
             np.dtype(_logits_info[1]) if _logits_info is not None else np.float32
         )
 
-        if "block_table" in self.session.input_names:
+        qpc_has_block_table = "block_table" in self.session.input_names
+        assert qpc_has_block_table == self.paged_attention, (
+            f"self.paged_attention={self.paged_attention} (derived from "
+            f"cache_config.enable_prefix_caching) disagrees with whether the "
+            f"loaded QPC exposes a 'block_table' input "
+            f"({qpc_has_block_table}). A stale QPC would otherwise fail "
+            f"with a confusing KeyError on first decode."
+        )
+        if qpc_has_block_table:
             self.decode_batch_inputs["block_table"] = np.full(
                 (1, self.decode_bsz, self.num_gpu_blocks_per_batch),
                 QAIC_BLOCK_TABLE_PADDING_VALUE,
@@ -1681,7 +1682,17 @@ def load_qaic_model(
                     speculative_model_type,
                 )
             logger.info("QEFF Compile called with %s", qaic_compile_config.cfg)
-            qpc_path = qeff_model.compile(**qaic_compile_config.cfg)
+            # qaic_config must be passed to compile() itself, not just to
+            # from_pretrained(): compile() forwards it (via **compiler_options)
+            # into the base _compile()/get_onnx_path()/transform() chain, which
+            # is what builds the paged-attention blocking config and decides
+            # whether block_table/slot_id are added to the ONNX export at all.
+            # Without it here, block_table silently never makes it into the
+            # exported graph regardless of what from_pretrained() received.
+            qpc_path = qeff_model.compile(
+                qaic_config=qaic_compile_config.qaic_config,
+                **qaic_compile_config.cfg,
+            )
             if isinstance(qpc_path, dict):
                 if (
                     "skip_lang" in qaic_compile_config.cfg
@@ -2304,18 +2315,25 @@ def _get_qaic_compile_config(
     if vllm_config.cache_config.enable_prefix_caching:
         # Add num_kv_blocks through qaic_config
         if vllm_config.kv_transfer_config:
-            kv_block_size = cfg.pop("kv_block_size")
-            num_kv_blocks = cdiv(vllm_config.model_config.max_model_len, kv_block_size)
+            kv_block_size = cfg.pop("kv_block_size", None)
+            if kv_block_size is None:
+                raise ValueError(
+                    "override_qaic_config['kv_block_size'] is required for "
+                    "disaggregated serving with prefix caching enabled."
+                )
+            num_kv_blocks = vllm_config.cache_config.num_gpu_blocks_override or cdiv(
+                vllm_config.model_config.max_model_len, kv_block_size
+            )
             vllm_config.cache_config.block_size = kv_block_size
         else:
-            num_kv_blocks = cdiv(
+            num_kv_blocks = vllm_config.cache_config.num_gpu_blocks_override or cdiv(
                 vllm_config.model_config.max_model_len, cfg["prefill_seq_len"]
             )
             vllm_config.cache_config.block_size = cfg["prefill_seq_len"]
         logger.info("Num KV Blocks: %s", num_kv_blocks)
         qaic_config["num_kv_blocks"] = num_kv_blocks
-        qaic_config["blocking_mode"] = "kv_paged"
-        qaic_config["enable_blocking"] = True
+        qaic_config.setdefault("blocking_mode", "kv_paged")
+        qaic_config.setdefault("enable_blocking", True)
     else:
         qaic_config["blocking_mode"] = ""
         qaic_config["enable_blocking"] = False

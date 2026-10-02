@@ -653,6 +653,7 @@ class QaicWorkerAoT(QaicWorker):
 
         if not self.cache_config.enable_prefix_caching:
             self.cache_config.num_gpu_blocks = num_gpu_blocks
+            # Sanity check: AOT requires exact block count; eager is flexible
             assert num_gpu_blocks == self.scheduler_config.max_num_seqs + 1
             return
         else:

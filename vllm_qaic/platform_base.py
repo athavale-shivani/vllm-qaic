@@ -269,6 +269,15 @@ class QaicPlatform(Platform):
         assert not (
             vllm_config.speculative_config and model_config.is_multimodal_model
         ), "SPD with Multi-modality is not yet supported for QAIC backend"
+        assert not (
+            vllm_config.speculative_config
+            and vllm_config.speculative_config.uses_draft_model()
+            and vllm_config.cache_config.enable_prefix_caching
+        ), (
+            "Draft-model speculative decoding with prefix caching is not yet "
+            "supported for QAIC backend: the draft model's prefill/decode "
+            "paths do not pass block_table/slot_id to the compiled QPC"
+        )
 
         if (
             cls.is_aot
@@ -298,34 +307,10 @@ class QaicPlatform(Platform):
                 )
                 scheduler_config.async_scheduling = False
 
-        cache_config = vllm_config.cache_config
-        if cache_config:
-            if model_config.enforce_eager:
-                cache_config.block_size = 16
-                # FIXME remove below hard-coding once PagedAttention is enabled
-                cache_config.enable_prefix_caching = False
-            else:
-                if cache_config.enable_prefix_caching:
-                    cache_config.mamba_block_size = (
-                        model_config.max_model_len
-                    )  # reset to "no-op" default
-                    cache_config.mamba_cache_mode = "none"  # reset to disabled
-                    cache_config.block_size = cls._pa_block_size(vllm_config)
-                elif (
-                    model_config.is_multimodal_model and model_config.is_encoder_decoder
-                ):
-                    cache_config.block_size = 100000
-                else:
-                    cache_config.block_size = model_config.max_model_len  # ctx_len
-
-        # disable async scheduling since Qaic does not yet support it
-        if scheduler_config.async_scheduling:
-            logger.warning(
-                "QAIC currently does not support async scheduling; "
-                "Falling back to non-async scheduling."
-            )
-            scheduler_config.async_scheduling = False
-
+        # Must run before the cache_config.block_size assignment below:
+        # _pa_block_size() reads override_qaic_config["prefill_seq_len"], and
+        # this block is what computes/writes its default when the caller
+        # didn't pass one explicitly.
         if cls.is_aot:
             if model_config.hf_config.model_type == "whisper":
                 # Whisper is an encoder-decoder model: vLLM disables chunked prefill
@@ -378,6 +363,22 @@ class QaicPlatform(Platform):
             # (now-overridden) max_num_batched_tokens when __post_init__
             # re-runs in the EngineCore subprocess (core.py:1038).
             scheduler_config.max_num_scheduled_tokens = None
+
+        cache_config = vllm_config.cache_config
+        if cache_config:
+            if model_config.enforce_eager:
+                cache_config.block_size = 16
+                # FIXME remove below hard-coding once PagedAttention is enabled
+                cache_config.enable_prefix_caching = False
+            else:
+                if cache_config.enable_prefix_caching:
+                    cache_config.mamba_block_size = (
+                        model_config.max_model_len
+                    )  # reset to "no-op" default
+                    cache_config.mamba_cache_mode = "none"  # reset to disabled
+                    cache_config.block_size = cls._pa_block_size(vllm_config)
+                else:
+                    cache_config.block_size = model_config.max_model_len  # ctx_len
 
         if cls.is_aot:
             # libiomp5.so (Intel's OpenMP runtime) OMP barrier/blocktime tuning —
@@ -432,6 +433,13 @@ class QaicPlatform(Platform):
         if vllm_config.kv_transfer_config:
             assert not vllm_config.lora_config, (
                 "LORA with Disaggregated serving not yet supported for QAIC backend"
+            )
+            assert not (
+                vllm_config.kv_transfer_config.kv_role != "kv_producer"
+                and vllm_config.cache_config.enable_prefix_caching
+            ), (
+                "Prefix caching with KV-role 'kv_consumer' or 'kv_both' not "
+                "yet supported for QAIC backend"
             )
             assert (
                 not vllm_config.speculative_config
@@ -558,16 +566,19 @@ class QaicPlatform(Platform):
                 scheduler_config.max_num_seqs
                 * scheduler_config.long_prefill_token_threshold
             )
-            if (
-                vllm_config.cache_config
-                and vllm_config.cache_config.enable_prefix_caching
-            ):
-                vllm_config.cache_config.block_size = cls._pa_block_size(vllm_config)
+            # Write the overridden prefill_seq_len before deriving block_size
+            # from it below -- otherwise _pa_block_size() reads the stale
+            # pre-override value.
             if "override_qaic_config" not in vllm_config.additional_config:
                 additional_config["override_qaic_config"] = {}
             additional_config["override_qaic_config"].update(
                 {"prefill_seq_len": model_config.max_model_len}
             )
+            if (
+                vllm_config.cache_config
+                and vllm_config.cache_config.enable_prefix_caching
+            ):
+                vllm_config.cache_config.block_size = cls._pa_block_size(vllm_config)
 
         if model_type in DYNAMIC_RESOLUTION_MODELS:
             if vllm_config.additional_config is None:
