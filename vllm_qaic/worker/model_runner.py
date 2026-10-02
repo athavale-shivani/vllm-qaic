@@ -522,25 +522,41 @@ class QaicModelRunnerAoT(GPUModelRunner):
         # Extract configuration params
         self.num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
         self.head_size = self.model_config.get_head_size()
-        # Some layers may carry an extra indexer side-cache (e.g. MiniMax's
-        # sparse-attention indexer) alongside the main attention cache.
+        # Some layers may carry an extra indexer side-cache (e.g. MiniMax
+        # M3's sparse-attention indexer) alongside the main attention cache.
         # Which layers is model-specific and not derivable from scalars
-        # (real MiniMax M3 picks them via an arbitrary per-layer mask —
-        # config.sparse_attention_config["sparse_attention_freq"] — not a
-        # contiguous run), so it's passed in explicitly as a list of layer
-        # indices rather than a count. Defaults make this a no-op for
-        # models that don't set indexer_layer_ids. indexer_head_size
-        # defaults to the main attention's head_size but is independently
-        # overridable: real MiniMax M3
-        # (vllm/models/minimax_m3/common/indexer.py) uses its own
-        # index_head_dim for the indexer cache rather than reusing the main
-        # attention's head_size.
+        # (MiniMax M3 picks them via an arbitrary per-layer mask, not a
+        # contiguous run), so auto-derive from the model's own HF config
+        # when available (sparse_attention_config["sparse_attention_freq"],
+        # a per-layer 0/1 mask; "sparse_index_dim" for the indexer's
+        # head_size) rather than requiring every caller to hand-copy that
+        # same information into override_qaic_config. override_qaic_config
+        # remains available to force/override both, e.g. for models that
+        # don't expose this HF config field at all.
+        sparse_attention_config = getattr(
+            self.model_config.hf_config, "sparse_attention_config", None
+        )
+        auto_indexer_layer_ids = set()
+        auto_indexer_head_size = None
+        if sparse_attention_config:
+            auto_indexer_layer_ids = {
+                i
+                for i, is_sparse in enumerate(
+                    sparse_attention_config.get("sparse_attention_freq", [])
+                )
+                if is_sparse
+            }
+            auto_indexer_head_size = sparse_attention_config.get("sparse_index_dim")
         override_qaic_config = (self.vllm_config.additional_config or {}).get(
             "override_qaic_config", {}
         )
-        self.indexer_layer_ids = set(override_qaic_config.get("indexer_layer_ids", []))
+        self.indexer_layer_ids = set(
+            override_qaic_config.get("indexer_layer_ids", auto_indexer_layer_ids)
+        )
         self.indexer_head_size = int(
-            override_qaic_config.get("indexer_head_size", self.head_size)
+            override_qaic_config.get(
+                "indexer_head_size", auto_indexer_head_size or self.head_size
+            )
         )
         self.execute_model_state: QaicExecuteModelState | None = None
         # Undrained AsyncModelRunnerOutput from sample_tokens(). Drained early
