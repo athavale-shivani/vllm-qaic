@@ -2385,6 +2385,12 @@ def _get_qaic_compile_config(
         del cfg["softmax"]
     if "task" in cfg:
         del cfg["task"]
+    # vLLM-side-only knobs consumed by QaicModelRunnerAoT.get_kv_cache_spec();
+    # not QEfficient.compile() arguments.
+    if "indexer_layer_ids" in cfg:
+        del cfg["indexer_layer_ids"]
+    if "indexer_head_size" in cfg:
+        del cfg["indexer_head_size"]
     # Add kv_cache_prefix for disagg only
     if vllm_config.kv_transfer_config:
         from .qaic_session_np import VLLM_KV_CACHE_PREFIX

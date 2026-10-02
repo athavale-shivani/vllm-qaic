@@ -717,17 +717,17 @@ class QaicWorkerAoT(QaicWorker):
 
     def determine_available_memory(self) -> int:
         num_gpu_blocks = self._compute_num_gpu_blocks()
-        # adapted from get_uniform_page_size
-        page_sizes = set(
+        # Sum each cache entry's own page size instead of assuming every
+        # entry is byte-identical — needed once a model carries more than
+        # one cache shape (e.g. GQA main attention + a separate indexer
+        # side cache) bypassed into a single KV-cache group. This mirrors
+        # the divisor vLLM's own get_kv_cache_config_from_groups() uses
+        # (available_memory // bytes_per_block) so the round trip
+        # reproduces num_gpu_blocks exactly.
+        total_page_size = sum(
             layer.page_size_bytes for layer in self.get_kv_cache_spec().values()
         )
-        assert len(page_sizes) == 1
-        page_size = page_sizes.pop()
-        return (
-            num_gpu_blocks
-            * page_size
-            * self.model_config.get_num_layers(self.parallel_config)
-        )
+        return num_gpu_blocks * total_page_size
 
     def _init_qaic_worker_distributed_environment(
         self,

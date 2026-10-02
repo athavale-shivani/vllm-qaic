@@ -32,7 +32,13 @@ from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, SupportedTask
 from vllm.utils.import_utils import PlaceholderModule
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheSpec,
+    MLAAttentionSpec,
+    SparseCacheRole,
+)
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -516,6 +522,26 @@ class QaicModelRunnerAoT(GPUModelRunner):
         # Extract configuration params
         self.num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
         self.head_size = self.model_config.get_head_size()
+        # Some layers may carry an extra indexer side-cache (e.g. MiniMax's
+        # sparse-attention indexer) alongside the main attention cache.
+        # Which layers is model-specific and not derivable from scalars
+        # (real MiniMax M3 picks them via an arbitrary per-layer mask —
+        # config.sparse_attention_config["sparse_attention_freq"] — not a
+        # contiguous run), so it's passed in explicitly as a list of layer
+        # indices rather than a count. Defaults make this a no-op for
+        # models that don't set indexer_layer_ids. indexer_head_size
+        # defaults to the main attention's head_size but is independently
+        # overridable: real MiniMax M3
+        # (vllm/models/minimax_m3/common/indexer.py) uses its own
+        # index_head_dim for the indexer cache rather than reusing the main
+        # attention's head_size.
+        override_qaic_config = (self.vllm_config.additional_config or {}).get(
+            "override_qaic_config", {}
+        )
+        self.indexer_layer_ids = set(override_qaic_config.get("indexer_layer_ids", []))
+        self.indexer_head_size = int(
+            override_qaic_config.get("indexer_head_size", self.head_size)
+        )
         self.execute_model_state: QaicExecuteModelState | None = None
         # Undrained AsyncModelRunnerOutput from sample_tokens(). Drained early
         # by the next execute_model()'s synchronize_input_prep() if it needs
@@ -2007,6 +2033,20 @@ class QaicModelRunnerAoT(GPUModelRunner):
                 head_size=self.head_size,
                 dtype=self.kv_cache_dtype,
             )
+            # Some layers may additionally carry a separate indexer side
+            # cache (e.g. MiniMax's sparse-attention indexer). MLAAttentionSpec
+            # shares FullAttentionSpec's uniform-type base in vLLM's
+            # KVCacheSpecRegistry, so with a matching block_size this collapses
+            # into the same KV-cache group as the main attention cache instead
+            # of triggering HybridKVCacheCoordinator.
+            if i in self.indexer_layer_ids:
+                kv_cache_spec[f"{layer_name}_indexer"] = MLAAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=self.indexer_head_size,
+                    dtype=self.kv_cache_dtype,
+                    cache_role=SparseCacheRole.INDEXER,
+                )
         return kv_cache_spec
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
