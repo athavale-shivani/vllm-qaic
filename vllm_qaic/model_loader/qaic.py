@@ -624,18 +624,26 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
     def _inject_pa_prefill_inputs(
         self,
         chunk_inputs: dict,
-        batch_idx: int,
         block_table: np.ndarray | None,
         req_index: int,
     ) -> None:
         if not self.paged_attention:
             return
-        if block_table is not None:
-            chunk_inputs["block_table"] = block_table[
-                req_index : req_index + 1
-            ].reshape(1, 1, self.num_gpu_blocks_per_batch)
-        else:
-            chunk_inputs["block_table"] = batch_idx
+        if block_table is None:
+            # Writing batch_idx in place of a real block_table would send a
+            # batch slot index to QEfficient's cache-scatter as if it were a
+            # validated physical block id -- silent KV corruption, not a
+            # loud failure. Currently unreachable for supported configs
+            # (platform_base.py blocks draft-model SpD + prefix caching, and
+            # the main model always supplies a real block_table), but fail
+            # fast here instead of relying solely on that distant guard.
+            raise AssertionError(
+                "paged_attention is enabled but no block_table was supplied "
+                "for this prefill call"
+            )
+        chunk_inputs["block_table"] = block_table[
+            req_index : req_index + 1
+        ].reshape(1, 1, self.num_gpu_blocks_per_batch)
 
     def _run_pipeline_prefill(
         self,
@@ -748,9 +756,7 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                     if logits is not None:
                         chunk_inputs["logits"] = logits[index : index + 1]
 
-                self._inject_pa_prefill_inputs(
-                    chunk_inputs, batch_index, block_table, index
-                )
+                self._inject_pa_prefill_inputs(chunk_inputs, block_table, index)
 
                 if self.session.prefill_available_exec_objs.empty():
                     if callback:
@@ -851,9 +857,7 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                 chunk_inputs["lora_ids"] = lora_index
             if mm_kwargs_list and (mm_kwargs := mm_kwargs_list[i]):
                 chunk_inputs.update(mm_kwargs)
-            self._inject_pa_prefill_inputs(
-                chunk_inputs, int(batch_indices[i]), block_table, i
-            )
+            self._inject_pa_prefill_inputs(chunk_inputs, block_table, i)
             # chunk the request
             n_chunks: int = iids.shape[-1] // self.prefill_seq_len
 
@@ -973,18 +977,21 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                 batch_inputs["lora_ids"][num_decodes:] = -1
 
         if self.paged_attention:
-            if block_table is not None:
-                batch_inputs["block_table"][:, :num_decodes] = block_table[:num_decodes]
-                if num_decodes < self.decode_bsz:
-                    batch_inputs["block_table"][:, num_decodes:] = (
-                        QAIC_BLOCK_TABLE_PADDING_VALUE
-                    )
-            else:
-                batch_inputs["block_table"][:, :num_decodes] = batch_indices
-                if num_decodes < self.decode_bsz:
-                    batch_inputs["block_table"][:, num_decodes:] = (
-                        QAIC_BLOCK_TABLE_PADDING_VALUE
-                    )
+            if block_table is None:
+                # See _inject_pa_prefill_inputs: writing batch_indices in
+                # place of a real block_table would send batch slot indices
+                # to QEfficient's cache-scatter as if they were validated
+                # physical block ids -- silent KV corruption, not a loud
+                # failure. Fail fast instead.
+                raise AssertionError(
+                    "paged_attention is enabled but no block_table was "
+                    "supplied for this decode call"
+                )
+            batch_inputs["block_table"][:, :num_decodes] = block_table[:num_decodes]
+            if num_decodes < self.decode_bsz:
+                batch_inputs["block_table"][:, num_decodes:] = (
+                    QAIC_BLOCK_TABLE_PADDING_VALUE
+                )
 
         # For spec-decode target: include num_logits_to_keep in batch_inputs
         # so the hardware knows how many token positions to compute logits for.
