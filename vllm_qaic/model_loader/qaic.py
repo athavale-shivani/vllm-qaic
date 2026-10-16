@@ -584,33 +584,28 @@ class QaicCausalLM(nn.Module, SupportsLoRA):
                     target_heads = self.kv_cache_info[buff_idx][0][1]
                     if buf.size > 0 and target_heads != buf.shape[1]:
                         target_ctx = self.kv_cache_info[buff_idx][0][2]
-                        if buf.shape[2] == target_ctx:
-                            assert buf.shape[1] == 1, (
-                                f"MLA KV head expansion expects num_heads=1 in received "
-                                f"buffer, got {buf.shape[1]} (shape={buf.shape})"
+                        assert buf.shape[2] % target_ctx == 0, (
+                            f"CP KV split expects ctx_len divisible by "
+                            f"decode block size, got ctx_len={buf.shape[2]}, "
+                            f"block_size={target_ctx} (shape={buf.shape})"
+                        )
+                        num_blocks = buf.shape[2] // target_ctx
+                        assert target_heads == buf.shape[1] * num_blocks, (
+                            f"CP KV split expects target_heads == "
+                            f"num_heads * num_blocks, got "
+                            f"target_heads={target_heads}, "
+                            f"num_heads={buf.shape[1]}, "
+                            f"num_blocks={num_blocks} (shape={buf.shape})"
+                        )
+                        num_heads = buf.shape[1]
+                        # Decode expects rows ordered row = cp_way * num_heads + kv_head.
+                        kv_caches[bidx][buff_idx] = np.ascontiguousarray(
+                            buf.reshape(
+                                buf.shape[0], num_heads, num_blocks, target_ctx, buf.shape[3]
                             )
-                            kv_caches[bidx][buff_idx] = np.broadcast_to(
-                                buf, (buf.shape[0], target_heads) + buf.shape[2:]
-                            )
-                        else:
-                            assert buf.shape[2] % target_ctx == 0, (
-                                f"CP KV split expects ctx_len divisible by "
-                                f"decode block size, got ctx_len={buf.shape[2]}, "
-                                f"block_size={target_ctx} (shape={buf.shape})"
-                            )
-                            num_blocks = buf.shape[2] // target_ctx
-                            assert target_heads == buf.shape[1] * num_blocks, (
-                                f"CP KV split expects target_heads == "
-                                f"num_heads * num_blocks, got "
-                                f"target_heads={target_heads}, "
-                                f"num_heads={buf.shape[1]}, "
-                                f"num_blocks={num_blocks} (shape={buf.shape})"
-                            )
-                            kv_caches[bidx][buff_idx] = np.ascontiguousarray(
-                                buf.reshape(
-                                    buf.shape[0], target_heads, target_ctx, buf.shape[3]
-                                )
-                            )
+                            .transpose(0, 2, 1, 3, 4)
+                            .reshape(buf.shape[0], target_heads, target_ctx, buf.shape[3])
+                        )
 
                 # Update kv cache setDataWith
                 _ = self.session.set_data_for_kv_handoff(
