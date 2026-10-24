@@ -5,6 +5,7 @@
 
 """Utilities for selecting and loading qaic models."""
 
+import copy
 import json
 import os
 import threading
@@ -1845,6 +1846,12 @@ def get_hf_model(
         # If tie_word_embeddings is not set correctly,
         # single QPC's output would be wrong
         hf_config.tie_word_embeddings = pretrained_hf_config.tie_word_embeddings
+    # vLLM relabels GPT-OSS's "mxfp4" quant_method to "gpt_oss_mxfp4" in place
+    # (config.py:GptOssForCausalLMConfig); translate back, on a copy, for QEfficient.
+    _quant_cfg = getattr(hf_config, "quantization_config", None)
+    if isinstance(_quant_cfg, dict) and _quant_cfg.get("quant_method") == "gpt_oss_mxfp4":
+        hf_config = copy.copy(hf_config)
+        hf_config.quantization_config = {**_quant_cfg, "quant_method": "mxfp4"}
     override_qaic_config = (
         additional_config.get("override_qaic_config") if additional_config else None
     )
@@ -1852,6 +1859,7 @@ def get_hf_model(
         "continuous_batching": (override_qaic_config or {}).get(
             "continuous_batching", True
         ),
+        "weight_free": (override_qaic_config or {}).get("weight_free", False),
         "qaic_config": qaic_config,
         "trust_remote_code": model_config.trust_remote_code,
         "revision": model_config.revision,
@@ -1910,6 +1918,13 @@ def get_hf_model(
             and _task not in ("score", "classify")
         ):
             args["pooling"] = override_qaic_config["pooling_method"]
+    if args["weight_free"] and model_type not in ("default", "encode"):
+        raise ValueError(
+            "weight_free=True is only supported for causal LM and embedding "
+            "models on the QAIC backend (QEFFAutoModelForCausalLM / "
+            f"QEffAutoModel); not supported for model_type={model_type!r} "
+            "(LoRA, image-text, speech, and sequence-classification models)."
+        )
     max_retries = 8
     retry_count = 0
     import requests
@@ -2043,6 +2058,9 @@ def _get_qaic_compile_config(
         "compile_only": False,
     }
     cfg.update(_clean_config(override_qaic_config, vllm_config))
+    # weight_free is from_pretrained()-only; strip so it doesn't leak into
+    # compile()'s **compiler_options. use_onnx_subfunctions must be passed explicitly.
+    cfg.pop("weight_free", None)
     # update through environment variable
     cfg.update(_clean_config(QAIC_DEVICE_CONFIG[speculative_model_type]))
     # set aic num core as per the hw if not provided
